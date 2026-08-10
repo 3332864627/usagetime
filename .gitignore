@@ -6,6 +6,7 @@ __pycache__/
 # Build
 build/
 dist/
+app.ico
 *.spec.bak
 
 # Database (local data)

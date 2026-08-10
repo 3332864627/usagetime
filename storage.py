@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import sys
+from contextlib import contextmanager
 from datetime import date, timedelta, datetime
 from threading import Lock
 
@@ -73,11 +74,19 @@ _DEFAULT_APP_GROUPS = {
 _app_groups_cache = None
 
 
+@contextmanager
 def _get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -270,29 +279,45 @@ def get_last_unfinished_fragment():
 
 def record_fragment(app_name, window_title, exe_path, start_iso, end_iso,
                     duration, is_idle=False):
-    if duration < 0.5:
-        return
-    save_title = get_setting("save_window_title", "0") == "1"
-    title_to_save = window_title if save_title else None
-    today = date.today().isoformat()
-    with _lock, _get_conn() as conn:
-        conn.execute(
-            """INSERT INTO usage_fragments
-               (date, app_name, window_title, exe_path,
-                start_time, end_time, duration_seconds, is_idle)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (today, app_name, title_to_save, exe_path,
-             start_iso, end_iso, round(duration, 2), 1 if is_idle else 0),
+    record_fragments_batch([{
+        "app_name": app_name,
+        "window_title": window_title,
+        "exe_path": exe_path,
+        "start_time": start_iso,
+        "end_time": end_iso,
+        "duration": duration,
+        "is_idle": is_idle,
+    }])
+
+
+def _split_fragment_by_day(fragment):
+    """按本地午夜拆分片段，保证每日统计归属正确。"""
+    try:
+        start = datetime.fromisoformat(fragment["start_time"])
+        end = datetime.fromisoformat(fragment["end_time"])
+    except (KeyError, TypeError, ValueError):
+        fallback = dict(fragment)
+        fallback["date"] = date.today().isoformat()
+        return [fallback]
+
+    if end <= start:
+        return []
+
+    parts = []
+    cursor = start
+    while cursor < end:
+        next_midnight = (cursor + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
         )
-        if not is_idle:
-            conn.execute(
-                """INSERT INTO app_usage (date, app_name, total_seconds, session_count)
-                   VALUES (?, ?, ?, 1)
-                   ON CONFLICT(date, app_name)
-                   DO UPDATE SET total_seconds = total_seconds + ?,
-                                 session_count = session_count + 1""",
-                (today, app_name, duration, duration),
-            )
+        part_end = min(end, next_midnight)
+        part = dict(fragment)
+        part["date"] = cursor.date().isoformat()
+        part["start_time"] = cursor.isoformat()
+        part["end_time"] = part_end.isoformat()
+        part["duration"] = (part_end - cursor).total_seconds()
+        parts.append(part)
+        cursor = part_end
+    return parts
 
 
 def record_fragments_batch(fragments):
@@ -300,30 +325,33 @@ def record_fragments_batch(fragments):
     if not fragments:
         return
     save_title = get_setting("save_window_title", "0") == "1"
-    today = date.today().isoformat()
     with _lock, _get_conn() as conn:
-        for f in fragments:
-            if f["duration"] < 0.5:
-                continue
-            title = f.get("window_title") if save_title else None
-            conn.execute(
-                """INSERT INTO usage_fragments
-                   (date, app_name, window_title, exe_path,
-                    start_time, end_time, duration_seconds, is_idle)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (today, f["app_name"], title, f.get("exe_path", ""),
-                 f["start_time"], f["end_time"],
-                 round(f["duration"], 2), 1 if f.get("is_idle") else 0),
-            )
-            if not f.get("is_idle"):
+        for original in fragments:
+            for f in _split_fragment_by_day(original):
+                if f["duration"] < 0.5:
+                    continue
+                title = f.get("window_title") if save_title else None
+                fragment_date = f["date"]
                 conn.execute(
-                    """INSERT INTO app_usage (date, app_name, total_seconds, session_count)
-                       VALUES (?, ?, ?, 1)
-                       ON CONFLICT(date, app_name)
-                       DO UPDATE SET total_seconds = total_seconds + ?,
-                                     session_count = session_count + 1""",
-                    (today, f["app_name"], f["duration"], f["duration"]),
+                    """INSERT INTO usage_fragments
+                       (date, app_name, window_title, exe_path,
+                        start_time, end_time, duration_seconds, is_idle)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (fragment_date, f["app_name"], title,
+                     f.get("exe_path", ""), f["start_time"], f["end_time"],
+                     round(f["duration"], 2), 1 if f.get("is_idle") else 0),
                 )
+                if not f.get("is_idle"):
+                    conn.execute(
+                        """INSERT INTO app_usage
+                           (date, app_name, total_seconds, session_count)
+                           VALUES (?, ?, ?, 1)
+                           ON CONFLICT(date, app_name)
+                           DO UPDATE SET total_seconds = total_seconds + ?,
+                                         session_count = session_count + 1""",
+                        (fragment_date, f["app_name"], f["duration"],
+                         f["duration"]),
+                    )
 
 
 # ── 查询 ──────────────────────────────────────────────────────

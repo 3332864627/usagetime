@@ -27,9 +27,22 @@ def _get_idle_seconds():
     lii.cbSize = ctypes.sizeof(lii)
     if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
         return 0.0
+    ctypes.windll.kernel32.GetTickCount.restype = wintypes.DWORD
     tick = ctypes.windll.kernel32.GetTickCount()
-    idle = (tick - lii.dwTime) / 1000.0
-    return max(0.0, idle)
+    return _idle_seconds_from_ticks(tick, lii.dwTime)
+
+
+def _idle_seconds_from_ticks(current_tick, last_input_tick):
+    """计算空闲秒数，并正确处理 DWORD 回绕。"""
+    elapsed_ms = (int(current_tick) - int(last_input_tick)) & 0xFFFFFFFF
+    return elapsed_ms / 1000.0
+
+
+def _active_time_cutoff(now, idle_seconds, idle_threshold):
+    """返回当前应用最多可以计时到的墙钟时间。"""
+    if idle_seconds <= idle_threshold:
+        return now
+    return now - idle_seconds + idle_threshold
 
 
 # ── 忽略的系统进程 ────────────────────────────────────────────
@@ -85,14 +98,31 @@ class WindowMonitor:
 
     def stop(self):
         self._running = False
-        self._flush_current()
-        self._flush_to_db()
         if self._thread:
             self._thread.join(timeout=5)
+        now = time.time()
+        if self._was_idle:
+            self._flush_idle(self._idle_start, now)
+            self._was_idle = False
+        else:
+            idle_secs = _get_idle_seconds()
+            self._flush_current(
+                _active_time_cutoff(now, idle_secs, self.idle_threshold)
+            )
+        self._flush_to_db()
 
     def pause(self):
         if not self._paused:
-            self._flush_current()
+            now = time.time()
+            if self._was_idle:
+                self._flush_idle(self._idle_start, now)
+                self._was_idle = False
+            else:
+                idle_secs = _get_idle_seconds()
+                self._flush_current(
+                    _active_time_cutoff(now, idle_secs, self.idle_threshold)
+                )
+            self._flush_to_db()
             self._paused = True
 
     def resume(self):
@@ -146,14 +176,14 @@ class WindowMonitor:
 
     # ── Flush ─────────────────────────────────────────────────
 
-    def _flush_current(self):
+    def _flush_current(self, end_time=None):
         """将当前正在计时的片段 flush 到缓冲区。"""
         if self._last_app and self._last_start:
-            now = time.time()
-            duration = now - self._last_start
+            end_time = time.time() if end_time is None else end_time
+            duration = end_time - self._last_start
             if duration >= 0.5:
                 start_iso = datetime.fromtimestamp(self._last_start).isoformat()
-                end_iso = datetime.fromtimestamp(now).isoformat()
+                end_iso = datetime.fromtimestamp(end_time).isoformat()
                 ignored = get_ignored_apps()
                 if self._last_app.lower() not in ignored:
                     self._add_to_buffer({
@@ -190,20 +220,24 @@ class WindowMonitor:
                 continue
 
             idle_secs = _get_idle_seconds()
-            is_idle = idle_secs > self.idle_threshold
+            idle_threshold = self.idle_threshold
+            is_idle = idle_secs > idle_threshold
+            now = time.time()
 
             if is_idle and not self._was_idle:
                 # 刚进入 idle
-                self._flush_current()
-                self._idle_start = time.time() - idle_secs
+                active_end = _active_time_cutoff(
+                    now, idle_secs, idle_threshold
+                )
+                self._flush_current(active_end)
+                self._idle_start = active_end
                 self._was_idle = True
 
             elif not is_idle and self._was_idle:
                 # 从 idle 恢复
-                idle_end = time.time()
-                self._flush_idle(self._idle_start, idle_end)
+                self._flush_idle(self._idle_start, now)
                 self._was_idle = False
-                self._last_start = time.time()
+                self._last_start = now
                 self._last_hwnd = None  # 强制重新检测窗口
 
             elif not is_idle:
@@ -218,7 +252,6 @@ class WindowMonitor:
                     self._last_start = time.time()
 
             # 定期 flush 缓冲区到 DB（空闲期间不 flush）
-            now = time.time()
             if not self._was_idle and now - self._last_flush >= self._flush_interval:
                 self._flush_current()
                 self._flush_to_db()

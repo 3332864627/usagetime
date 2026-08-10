@@ -1,3 +1,4 @@
+import os
 import sys
 import winreg
 
@@ -9,7 +10,7 @@ def _get_command():
     if getattr(sys, 'frozen', False):
         return f'"{sys.executable}"'
     python = sys.executable
-    script = sys.argv[0]
+    script = os.path.abspath(sys.argv[0])
     return f'"{python}" "{script}"'
 
 
