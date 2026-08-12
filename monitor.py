@@ -10,6 +10,7 @@ import psutil
 
 from storage import (
     record_fragments_batch, get_ignored_apps, get_app_rules, get_setting,
+    canonical_app_name,
 )
 
 
@@ -53,6 +54,7 @@ _IGNORED = {
     "systemsettings.exe", "searchapp.exe", "startmenuexperiencehost.exe",
     "runtimebroker.exe", "sihost.exe", "fontdrvhost.exe",
     "dwm.exe", "csrss.exe",
+    "usagetracker.exe", "usagetime.exe",
 }
 
 
@@ -155,7 +157,7 @@ class WindowMonitor:
 
         # 应用合并规则
         rules = get_app_rules()
-        name = rules.get(name, name)
+        name = canonical_app_name(name, rules, exe)
 
         return hwnd, name, title, exe
 

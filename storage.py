@@ -25,9 +25,16 @@ _APP_NAMES = {
     "firefox.exe": "Firefox 浏览器",
     "code.exe": "VS Code",
     "code - insiders.exe": "VS Code",
+    "codex.exe": "Codex",
     "explorer.exe": "文件资源管理器",
     "wechat.exe": "微信",
     "wechatappex.exe": "微信",
+    "weixin.exe": "微信",
+    "baidunetdisk.exe": "百度网盘",
+    "baidunetdiskunite.exe": "百度网盘",
+    "hpeesofde.exe": "Keysight ADS",
+    "hpeesofdds.exe": "Keysight ADS",
+    "hpeesofsess.exe": "Keysight ADS",
     "qq.exe": "QQ",
     "dingtalk.exe": "钉钉",
     "feishu.exe": "飞书",
@@ -67,11 +74,22 @@ _DEFAULT_APP_GROUPS = {
     "riotclientux.exe":       "leagueclientux.exe",
     "riotclientservices.exe": "leagueclientux.exe",
     "wechatappex.exe":        "wechat.exe",
+    "wechat.exe":             "weixin.exe",
+    "weixin.exe":             "weixin.exe",
+    "baidunetdiskunite.exe":  "baidunetdisk.exe",
+    "baidunetdisk.exe":       "baidunetdisk.exe",
+    "hpeesofdds.exe":         "hpeesofde.exe",
+    "hpeesofsess.exe":        "hpeesofde.exe",
+    "hpeesofde.exe":          "hpeesofde.exe",
     "code - insiders.exe":    "code.exe",
 }
 
 # 运行时缓存
 _app_groups_cache = None
+
+_PREFERRED_ICON_EXECUTABLES = {
+    "hpeesofde.exe": "hpeesofdds.exe",
+}
 
 
 @contextmanager
@@ -165,15 +183,32 @@ def init_db():
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (k, v),
             )
-        # 将默认规则写入 DB（仅在表为空时）
-        count = conn.execute("SELECT COUNT(*) as c FROM app_rules").fetchone()["c"]
-        if count == 0:
-            for child, parent in _DEFAULT_APP_GROUPS.items():
-                display = _APP_NAMES_LOWER.get(child) if child != parent else None
-                conn.execute(
-                    "INSERT OR IGNORE INTO app_rules (child_name, parent_name, display_name) VALUES (?, ?, ?)",
-                    (child, parent, display),
-                )
+        # 始终补齐新版本加入的默认规则，已有自定义规则不会被覆盖。
+        for child, parent in _DEFAULT_APP_GROUPS.items():
+            display = _APP_NAMES_LOWER.get(child) if child != parent else None
+            conn.execute(
+                "INSERT OR IGNORE INTO app_rules (child_name, parent_name, display_name) VALUES (?, ?, ?)",
+                (child, parent, display),
+            )
+        # 旧版本曾把 WeChatAppEx 映射到 wechat.exe；新版统一到 weixin.exe。
+        conn.execute(
+            """UPDATE app_rules
+               SET parent_name = 'weixin.exe', display_name = ?
+               WHERE child_name = 'wechatappex.exe'
+                 AND parent_name = 'wechat.exe'""",
+            (_APP_NAMES_LOWER["weixin.exe"],),
+        )
+        # 旧版本可能把统计器自己的窗口计入使用时间，升级时清理这些记录。
+        self_apps = ("usagetracker.exe", "usagetime.exe")
+        placeholders = ",".join("?" for _ in self_apps)
+        conn.execute(
+            f"DELETE FROM usage_fragments WHERE LOWER(app_name) IN ({placeholders})",
+            self_apps,
+        )
+        conn.execute(
+            f"DELETE FROM app_usage WHERE LOWER(app_name) IN ({placeholders})",
+            self_apps,
+        )
 
 
 # ── 设置 ──────────────────────────────────────────────────────
@@ -226,6 +261,23 @@ def get_app_rules():
         rules[r["child_name"].lower()] = r["parent_name"].lower()
     _app_groups_cache = rules
     return rules
+
+
+def canonical_app_name(app_name, rules=None, exe_path=""):
+    """沿合并规则找到最终应用名，并防止循环规则卡死。"""
+    rules = get_app_rules() if rules is None else rules
+    current = app_name.lower()
+    if (current == "chatgpt.exe" and
+            "openai.codex_" in exe_path.lower()):
+        current = "codex.exe"
+    seen = set()
+    while current not in seen:
+        seen.add(current)
+        parent = rules.get(current, current)
+        if parent == current:
+            break
+        current = parent
+    return current
 
 
 def get_app_rules_with_display():
@@ -378,6 +430,11 @@ def get_display_name(app_name):
             if prow and prow["display_name"]:
                 return prow["display_name"]
 
+    # 已知应用使用稳定名称，避免 explorer.exe 等通用启动器被快捷方式误认。
+    name = _APP_NAMES_LOWER.get(app_name.lower())
+    if name:
+        return name
+
     # 快捷方式名称
     try:
         from icons import get_shortcut_info
@@ -390,9 +447,6 @@ def get_display_name(app_name):
     desc = _extract_display_name(app_name)
     if desc:
         return desc
-    name = _APP_NAMES_LOWER.get(app_name.lower())
-    if name:
-        return name
     if app_name.lower().endswith(".exe"):
         return app_name[:-4]
     return app_name
@@ -436,13 +490,51 @@ def _extract_display_name(app_name):
     return None
 
 
-def _merge_rows(rows):
+def _get_recent_exe_paths():
+    """返回每个应用记录过的可执行文件路径，最近路径排在前面。"""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """SELECT LOWER(app_name) AS app_name, exe_path,
+                      MAX(id) AS last_id
+               FROM usage_fragments
+               WHERE exe_path IS NOT NULL AND TRIM(exe_path) != ''
+               GROUP BY LOWER(app_name), exe_path
+               ORDER BY last_id DESC"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _preferred_exe_path(app_name, recent_paths, rules):
+    candidates = [
+        row for row in recent_paths
+        if canonical_app_name(
+            row["app_name"], rules, row["exe_path"]
+        ) == app_name
+    ]
+    preferred_name = _PREFERRED_ICON_EXECUTABLES.get(app_name)
+    if preferred_name:
+        for row in candidates:
+            if os.path.basename(row["exe_path"]).lower() == preferred_name:
+                return row["exe_path"]
+    for row in candidates:
+        if os.path.basename(row["exe_path"]).lower() == app_name:
+            return row["exe_path"]
+    return candidates[0]["exe_path"] if candidates else ""
+
+
+def _merge_rows(rows, recent_paths=None):
     rules = get_app_rules()
+    recent_paths = _get_recent_exe_paths() if recent_paths is None else recent_paths
     merged = {}
     for r in rows:
         d = dict(r)
         app = d["app_name"].lower()
-        key = rules.get(app, app)
+        app_paths = [
+            path for path in recent_paths
+            if path["app_name"] == app
+        ]
+        latest_path = app_paths[0]["exe_path"] if app_paths else ""
+        key = canonical_app_name(app, rules, latest_path)
         if key in merged:
             merged[key]["total_seconds"] += d["total_seconds"]
             if "session_count" in d:
@@ -454,6 +546,7 @@ def _merge_rows(rows):
                 "app_name": key,
                 "total_seconds": d["total_seconds"],
                 "display_name": get_display_name(key),
+                "exe_path": _preferred_exe_path(key, recent_paths, rules),
             }
             if "session_count" in d:
                 merged[key]["session_count"] = d["session_count"]
@@ -556,7 +649,15 @@ def get_fragments_for_date(target_date=None, include_idle=False):
     query += " ORDER BY start_time"
     with _get_conn() as conn:
         rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    rules = get_app_rules()
+    result = []
+    for row in rows:
+        fragment = dict(row)
+        fragment["app_name"] = canonical_app_name(
+            fragment["app_name"], rules, fragment.get("exe_path", "")
+        )
+        result.append(fragment)
+    return result
 
 
 # ── 忽略列表 ──────────────────────────────────────────────────

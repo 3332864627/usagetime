@@ -1133,10 +1133,11 @@ class Dashboard(QWidget):
             pct = (s["total_seconds"] / total * 100) if total > 0 else 0
             row = self._make_row(
                 s["app_name"], s["display_name"],
-                s["total_seconds"], pct, color)
+                s["total_seconds"], pct, color, s.get("exe_path", ""))
             self.list_layout.insertWidget(self.list_layout.count() - 1, row)
 
-    def _make_row(self, app_name, display_name, seconds, pct, color):
+    def _make_row(self, app_name, display_name, seconds, pct, color,
+                  exe_path=""):
         row = QFrame()
         row.setStyleSheet(
             f"QFrame{{background:transparent;border:none;border-radius:8px;}}"
@@ -1149,7 +1150,9 @@ class Dashboard(QWidget):
         # Icon
         icon_lbl = QLabel()
         icon_lbl.setFixedSize(20, 20)
-        pil_img = get_icon(app_name, display_name, size=20)
+        pil_img = get_icon(
+            app_name, display_name, size=20, exe_path=exe_path
+        )
         px = _pil_to_pixmap(pil_img, 20)
         icon_lbl.setPixmap(px)
         lay.addWidget(icon_lbl)

@@ -1,5 +1,7 @@
 import sys
 import os
+import ctypes
+import ctypes.wintypes as wintypes
 
 if getattr(sys, 'frozen', False):
     sys.path.insert(0, os.path.dirname(sys.executable))
@@ -13,7 +15,27 @@ from monitor import WindowMonitor
 from tray import TrayApp, _create_tray_icon
 
 
+_INSTANCE_MUTEX_NAME = "Local\\DABIAN-afk.UsageTracker"
+
+
+def _acquire_single_instance():
+    """返回互斥量句柄；已有实例运行时返回 None。"""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    handle = kernel32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
+    if not handle:
+        return None
+    if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
 def main():
+    instance_mutex = _acquire_single_instance()
+    if instance_mutex is None:
+        return
+
     init_db()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -38,7 +60,9 @@ def main():
     tray = TrayApp(monitor)
     tray.show()
 
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    ctypes.windll.kernel32.CloseHandle(instance_mutex)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

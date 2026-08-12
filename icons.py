@@ -50,6 +50,12 @@ _cache = {}
 _exe_path_cache = {}
 _shortcut_cache = None  # {exe_name_lower: {display_name, icon_path, icon_index}}
 
+_GENERIC_SHORTCUT_TARGETS = {
+    "cmd.exe", "explorer.exe", "java.exe", "javaw.exe",
+    "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe",
+    "rundll32.exe", "wscript.exe",
+}
+
 
 def _scan_shortcuts():
     """扫描桌面和开始菜单的快捷方式，建立 exe → 名称/图标映射。"""
@@ -94,6 +100,8 @@ def _scan_shortcuts():
             if not target:
                 continue
             exe_name = os.path.basename(target).lower()
+            if exe_name in _GENERIC_SHORTCUT_TARGETS:
+                continue
             # 显示名 = 快捷方式文件名（去掉 .lnk）
             display_name = os.path.splitext(os.path.basename(lnk_path))[0]
             icon_path = sc.IconLocation
@@ -140,10 +148,10 @@ def _extract_icon_iimagelist(exe_path, size=32):
     """Extract icon via IImageList for high quality."""
     sfi = SHFILEINFO()
     flags = SHGFI_SYSICONINDEX | SHGFI_ICON
-    shell32.SHGetFileInfoW(exe_path, 0, ctypes.byref(sfi),
-                           ctypes.sizeof(sfi), flags)
+    result = shell32.SHGetFileInfoW(exe_path, 0, ctypes.byref(sfi),
+                                    ctypes.sizeof(sfi), flags)
 
-    if not sfi.iIcon:
+    if not result:
         return None
 
     try:
@@ -264,14 +272,14 @@ def _find_exe_path(app_name):
         del _exe_path_cache[app_lower]
 
     import psutil
-    from storage import get_app_rules
+    from storage import canonical_app_name, get_app_rules
 
     rules = get_app_rules()
 
     # 收集所有同类进程名
     aliases = {app_lower}
     for child, parent in rules.items():
-        if parent == app_lower:
+        if canonical_app_name(child, rules) == app_lower:
             aliases.add(child)
 
     result = None
@@ -322,13 +330,25 @@ def _make_fallback_icon(display_name, size=28):
     return img
 
 
-def get_icon(app_name, display_name="", size=28):
-    """Get app icon as PIL Image. Cached. Prioritizes shortcut icons."""
-    cache_key = f"{app_name}_{size}"
+def get_icon(app_name, display_name="", size=28, exe_path=""):
+    """Get app icon, preferring the executable path recorded while in use."""
+    normalized_path = os.path.normcase(exe_path) if exe_path else ""
+    cache_key = f"{app_name}_{normalized_path}_{size}"
     if cache_key in _cache:
         return _cache[cache_key]
 
-    # Try shortcut icon first
+    # A canonical executable path is the most reliable source.
+    is_canonical_path = (
+        exe_path and
+        os.path.basename(exe_path).lower() == app_name.lower()
+    )
+    if is_canonical_path and os.path.exists(exe_path):
+        img = _extract_icon(exe_path, size)
+        if img:
+            _cache[cache_key] = img
+            return img
+
+    # An exact shortcut is preferable to a helper process in a merged app.
     sc_info = get_shortcut_info(app_name)
     if sc_info:
         icon_path = sc_info["icon_path"]
@@ -337,6 +357,14 @@ def get_icon(app_name, display_name="", size=28):
             if img:
                 _cache[cache_key] = img
                 return img
+
+    # If only a helper executable was recorded, its icon is still better than
+    # a generic fallback when no canonical shortcut exists.
+    if exe_path and os.path.exists(exe_path):
+        img = _extract_icon(exe_path, size)
+        if img:
+            _cache[cache_key] = img
+            return img
 
     # Try running process
     exe_path = _find_exe_path(app_name)
