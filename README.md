@@ -2,6 +2,9 @@
 
 Windows 桌面屏幕使用时间统计工具，帮助你了解每天在各个应用上花费的时间。
 
+> 本项目基于 [DABIAN-afk/usagetime](https://github.com/DABIAN-afk/usagetime)（MIT License）修改，
+> 主要改动：锁屏/待机恢复期间停止计时、新增本月统计、界面渲染与数据库连接优化。
+
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![PySide6](https://img.shields.io/badge/UI-PySide6-4FC08D)
 ![License](https://img.shields.io/badge/License-MIT-green)

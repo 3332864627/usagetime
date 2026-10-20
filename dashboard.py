@@ -13,6 +13,7 @@ from PIL import Image
 from storage import (
     get_stats, get_daily_total, get_available_dates,
     get_week_stats, get_week_app_stats,
+    get_month_stats, get_month_app_stats,
     get_hourly_stats,
     format_duration_short, format_time_short,
     clear_all_data, get_ignored_apps,
@@ -140,7 +141,12 @@ class _BarChart(QWidget):
         n = len(self._data)
         gap = 20
         avail = w - margin_left - 20
-        bar_w = max(14, (avail - gap * (n - 1)) // n)
+        bar_w = (avail - gap * (n - 1)) // n
+        if bar_w < gap:
+            # 柱子比间距还窄（本月最多 31 天），改成自动收窄间距铺满
+            gap = max(2, avail // n // 4)
+            bar_w = max(3, (avail - gap * (n - 1)) // n)
+        bar_w = min(bar_w, 60)  # 月初只有一两天时，别让柱子撑成一整块
         total_w = bar_w * n + gap * (n - 1)
         sx = margin_left + (avail - total_w) // 2
 
@@ -154,7 +160,8 @@ class _BarChart(QWidget):
         p.setFont(_font(9))
         p.setPen(QColor(GRAY))
         max_hours = max(1, int((max_val + 3599) // 3600))  # 向上取整到小时
-        for h in range(0, max_hours + 1):
+        step_h = 1 if max_hours <= 6 else (2 if max_hours <= 12 else 4)
+        for h in range(0, max_hours + 1, step_h):
             t = h * 3600
             ty = chart_b - int(t / max_val * chart_h) if max_val > 0 else chart_b
             label = f"{h}h"
@@ -169,7 +176,7 @@ class _BarChart(QWidget):
             x = sx + i * (bar_w + gap)
             val = day["total_seconds"]
             d = date.fromisoformat(day["date"])
-            day_name = DAY_LABELS[d.weekday()]
+            day_name = DAY_LABELS[d.weekday()] if n <= 7 else str(d.day)
             is_today = day["date"] == self._today
 
             if val > 0:
@@ -197,11 +204,13 @@ class _BarChart(QWidget):
                 p.setBrush(color)
                 p.drawRoundedRect(x, y_top, bar_w, bar_h, 4, 4)
 
-            # 日名
-            p.setFont(_font(9, is_today))
-            p.setPen(QColor(ACCENT if is_today else GRAY))
-            p.drawText(x, chart_b + 2, bar_w, 16,
-                       Qt.AlignCenter, day_name)
+            # 日名（天数多时隔几个显示一个，免得挤成一团）
+            label_step = 1 if n <= 10 else (3 if n <= 21 else 5)
+            if i % label_step == 0 or is_today:
+                p.setFont(_font(9, is_today))
+                p.setPen(QColor(ACCENT if is_today else GRAY))
+                p.drawText(x - 8, chart_b + 2, bar_w + 16, 16,
+                           Qt.AlignCenter, day_name)
 
         # 悬停时显示时间（柱子居中位置）
         if 0 <= self._hovered < len(self._data):
@@ -267,7 +276,11 @@ class _HourlyChart(QWidget):
 
         w = self.width()
         h = self.height()
-        max_val = max(self._hourly) if max(self._hourly) > 0 else 3600
+        if self._fixed_labels:
+            # 刻度写死 0/30m/60m，柱子也必须按 60 分钟画，否则刻度和柱子对不上
+            max_val = 3600
+        else:
+            max_val = max(self._hourly) if max(self._hourly) > 0 else 3600
 
         margin_left = 40
         margin_bottom = 20
@@ -302,7 +315,7 @@ class _HourlyChart(QWidget):
         for i in range(24):
             x = sx + i * (bar_w + gap)
             val = self._hourly[i]
-            pct = val / max_val if max_val > 0 else 0
+            pct = min(1.0, val / max_val) if max_val > 0 else 0
             bar_h = max(0, int(pct * chart_h))
             y_top = chart_b - bar_h
 
@@ -464,6 +477,38 @@ class _TimelineView(QWidget):
                        format_time_short(last_seg["end_time"]))
 
         p.end()
+
+
+class _ProgressBar(QFrame):
+    """行内进度条：填充块按轨道实际宽度 × 占比自适应。
+
+    之前的写法用控件构造时的默认宽度（640）当基准，柱子会系统性偏长
+    （占比 43% 画成 72%、占比 60% 以上直接顶满），这里改为跟随实际宽度。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(3)
+        self.setStyleSheet(f"background:{CHART_BG};border-radius:1px;")
+        self._fill = QFrame(self)
+        self._fill.setFixedHeight(3)
+        self._fill.setStyleSheet("border-radius:1px;")
+        self._frac = 0.0
+        self._color = None
+
+    def set_value(self, frac, color):
+        self._frac = max(0.0, min(1.0, frac))
+        if color != self._color:  # 颜色没变就不重设样式表
+            self._color = color
+            self._fill.setStyleSheet(f"background:{color};border-radius:1px;")
+        self._relayout()
+
+    def _relayout(self):
+        self._fill.setFixedWidth(max(2, int(self.width() * self._frac)))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout()
 
 
 class _FirstRunWizard(QDialog):
@@ -634,8 +679,10 @@ class Dashboard(QWidget):
         toggle_bar.setSpacing(4)
         self.btn_daily = QPushButton("今日")
         self.btn_weekly = QPushButton("本周")
+        self.btn_month = QPushButton("本月")
         self.btn_settings = QPushButton("设置")
-        for btn in (self.btn_daily, self.btn_weekly, self.btn_settings):
+        for btn in (self.btn_daily, self.btn_weekly, self.btn_month,
+                    self.btn_settings):
             btn.setCursor(Qt.PointingHandCursor)
             btn.setFixedHeight(32)
             btn.setMinimumWidth(64)
@@ -646,9 +693,11 @@ class Dashboard(QWidget):
             )
         self.btn_daily.clicked.connect(lambda: self._switch_tab("daily"))
         self.btn_weekly.clicked.connect(lambda: self._switch_tab("weekly"))
+        self.btn_month.clicked.connect(lambda: self._switch_tab("month"))
         self.btn_settings.clicked.connect(lambda: self._switch_tab("settings"))
         toggle_bar.addWidget(self.btn_daily)
         toggle_bar.addWidget(self.btn_weekly)
+        toggle_bar.addWidget(self.btn_month)
         toggle_bar.addWidget(self.btn_settings)
         content_lay.addLayout(toggle_bar)
 
@@ -801,6 +850,9 @@ class Dashboard(QWidget):
         self.list_layout.setContentsMargins(0, 0, 0, 0)
         self.list_layout.setSpacing(1)
         self.list_layout.addStretch()
+        # 行控件复用池：刷新时只更新内容，不销毁重建（重建 57 行要 230ms）
+        self._rows = []
+        self._empty_lbl = None
         scroll.setWidget(self.list_container)
         list_lay.addWidget(scroll)
 
@@ -1011,19 +1063,21 @@ class Dashboard(QWidget):
             f"QPushButton:hover{{background:{HOVER};}}"
         )
 
-        for btn in (self.btn_daily, self.btn_weekly, self.btn_settings):
+        for btn in (self.btn_daily, self.btn_weekly, self.btn_month,
+                    self.btn_settings):
             btn.setStyleSheet(inactive_style)
 
         tab_map = {
             "daily": self.btn_daily,
             "weekly": self.btn_weekly,
+            "month": self.btn_month,
             "settings": self.btn_settings,
         }
         tab_map[tab].setStyleSheet(active_style)
 
-        show_stats = tab in ("daily", "weekly")
+        show_stats = tab in ("daily", "weekly", "month")
         self.stats_container.setVisible(show_stats)
-        self.chart_card.setVisible(tab == "weekly")
+        self.chart_card.setVisible(tab in ("weekly", "month"))
         self.hourly_card.setVisible(tab == "daily")
         self.settings_widget.setVisible(tab == "settings")
 
@@ -1038,6 +1092,9 @@ class Dashboard(QWidget):
             self._view_date -= timedelta(days=1)
         elif self._current_tab == "weekly":
             self._view_date -= timedelta(days=7)
+        elif self._current_tab == "month":
+            # 退回上个月：本月 1 号往前一天，就是上个月最后一天
+            self._view_date = self._view_date.replace(day=1) - timedelta(days=1)
         self._refresh()
 
     def _next_period(self):
@@ -1050,6 +1107,13 @@ class Dashboard(QWidget):
             new_date = self._view_date + timedelta(days=7)
             if new_date <= today:
                 self._view_date = new_date
+        elif self._current_tab == "month":
+            # 前进到下个月的最后一天，但不能越过今天
+            first_next = (self._view_date.replace(day=28)
+                          + timedelta(days=4)).replace(day=1)
+            last_next = (first_next + timedelta(days=31)).replace(day=1) \
+                        - timedelta(days=1)
+            self._view_date = min(last_next, today)
         self._refresh()
 
     def _update_arrow_state(self):
@@ -1057,6 +1121,9 @@ class Dashboard(QWidget):
         is_today = self._view_date >= today
         if self._current_tab == "weekly":
             is_today = self._view_date + timedelta(days=6) >= today
+        elif self._current_tab == "month":
+            is_today = (self._view_date.year, self._view_date.month) == \
+                       (today.year, today.month)
         self.btn_next.setEnabled(not is_today)
         if is_today:
             self.btn_next.setStyleSheet(
@@ -1077,6 +1144,8 @@ class Dashboard(QWidget):
             self._refresh_daily()
         elif self._current_tab == "weekly":
             self._refresh_weekly()
+        elif self._current_tab == "month":
+            self._refresh_month()
         self._update_pause_button()
 
     def _refresh_daily(self):
@@ -1114,30 +1183,53 @@ class Dashboard(QWidget):
         self._populate_list(app_stats, week_total)
         self._update_arrow_state()
 
-    def _populate_list(self, stats, total):
-        while self.list_layout.count() > 1:
-            item = self.list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+    def _refresh_month(self):
+        d = self._view_date
+        month_stats = get_month_stats(d.isoformat())
+        app_stats = get_month_app_stats(d.isoformat())
+        month_total = sum(x["total_seconds"] for x in month_stats)
 
-        if not stats:
-            lbl = QLabel("暂无使用数据")
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setFont(_font(13))
-            lbl.setStyleSheet(f"color:{MUTED};padding:40px;")
-            self.list_layout.insertWidget(0, lbl)
-            return
+        today = date.today()
+        is_this_month = (d.year, d.month) == (today.year, today.month)
+        self.lbl_day.setText("本月" if is_this_month else f"{d.month}月")
+        self.lbl_date.setText(f"{d.year}年{d.month}月")
+        self.lbl_total.setText(format_duration_short(month_total))
+        self.lbl_apps.setText(f"{len(app_stats)} 个应用")
+
+        self.bar_chart.set_data(month_stats, d.isoformat())
+        self._populate_list(app_stats, month_total)
+        self._update_arrow_state()
+
+    def _populate_list(self, stats, total):
+        # 行控件复用：不够就补建，多了就隐藏；刷新时只更新内容
+        while len(self._rows) < len(stats):
+            refs = self._build_row()
+            self.list_layout.insertWidget(self.list_layout.count() - 1,
+                                          refs["frame"])
+            self._rows.append(refs)
 
         for i, s in enumerate(stats):
             color = APP_COLORS[i % len(APP_COLORS)]
             pct = (s["total_seconds"] / total * 100) if total > 0 else 0
-            row = self._make_row(
-                s["app_name"], s["display_name"],
-                s["total_seconds"], pct, color, s.get("exe_path", ""))
-            self.list_layout.insertWidget(self.list_layout.count() - 1, row)
+            self._update_row(self._rows[i], s, pct, color)
 
-    def _make_row(self, app_name, display_name, seconds, pct, color,
-                  exe_path=""):
+        for refs in self._rows[len(stats):]:
+            refs["frame"].setVisible(False)
+
+        # 空状态提示
+        if not stats:
+            if self._empty_lbl is None:
+                self._empty_lbl = QLabel("暂无使用数据")
+                self._empty_lbl.setAlignment(Qt.AlignCenter)
+                self._empty_lbl.setFont(_font(13))
+                self._empty_lbl.setStyleSheet(f"color:{MUTED};padding:40px;")
+                self.list_layout.insertWidget(0, self._empty_lbl)
+            self._empty_lbl.setVisible(True)
+        elif self._empty_lbl is not None:
+            self._empty_lbl.setVisible(False)
+
+    def _build_row(self):
+        """创建一行控件（整个程序生命周期只建一次）。"""
         row = QFrame()
         row.setStyleSheet(
             f"QFrame{{background:transparent;border:none;border-radius:8px;}}"
@@ -1147,45 +1239,29 @@ class Dashboard(QWidget):
         lay.setContentsMargins(10, 4, 10, 4)
         lay.setSpacing(6)
 
-        # Icon
         icon_lbl = QLabel()
         icon_lbl.setFixedSize(20, 20)
-        pil_img = get_icon(
-            app_name, display_name, size=20, exe_path=exe_path
-        )
-        px = _pil_to_pixmap(pil_img, 20)
-        icon_lbl.setPixmap(px)
         lay.addWidget(icon_lbl)
 
-        # Name + bar
         mid = QVBoxLayout()
         mid.setSpacing(2)
-        name_lbl = QLabel(display_name)
+        name_lbl = QLabel()
         name_lbl.setFont(_font(11))
         name_lbl.setStyleSheet(f"color:{TEXT};")
         mid.addWidget(name_lbl)
 
-        bar_bg = QFrame()
-        bar_bg.setFixedHeight(3)
-        bar_bg.setStyleSheet(f"background:{CHART_BG};border-radius:1px;")
-        bar_fg = QFrame(bar_bg)
-        bar_fg.setFixedHeight(3)
-        frac = max(0.005, pct / 100)
-        bar_fg.setFixedWidth(max(2, int(bar_bg.width() * frac)))
-        bar_fg.setStyleSheet(f"background:{color};border-radius:1px;")
-        bar_fg.resize(max(2, int(300 * frac)), 3)
-        mid.addWidget(bar_bg)
+        bar = _ProgressBar()
+        mid.addWidget(bar)
 
         lay.addLayout(mid, 1)
 
-        # Time + pct
         right = QVBoxLayout()
         right.setSpacing(2)
-        time_lbl = QLabel(format_duration_short(seconds))
+        time_lbl = QLabel()
         time_lbl.setFont(_font(11, True))
         time_lbl.setStyleSheet(f"color:{TEXT};")
         time_lbl.setAlignment(Qt.AlignRight)
-        pct_lbl = QLabel(f"{pct:.1f}%")
+        pct_lbl = QLabel()
         pct_lbl.setFont(_font(9))
         pct_lbl.setStyleSheet(f"color:{MUTED};")
         pct_lbl.setAlignment(Qt.AlignRight)
@@ -1193,7 +1269,32 @@ class Dashboard(QWidget):
         right.addWidget(pct_lbl)
         lay.addLayout(right)
 
-        return row
+        return {
+            "frame": row, "icon": icon_lbl, "name": name_lbl,
+            "bar": bar,
+            "time": time_lbl, "pct": pct_lbl,
+            "icon_key": None,
+        }
+
+    def _update_row(self, refs, s, pct, color):
+        """更新一行内容；图标没变就不重提，进度条自己缓存颜色。"""
+        icon_key = f"{s['app_name']}|{s.get('exe_path', '')}"
+        if refs["icon_key"] != icon_key:
+            pil_img = get_icon(
+                s["app_name"], s["display_name"], size=20,
+                exe_path=s.get("exe_path", ""),
+            )
+            refs["icon"].setPixmap(_pil_to_pixmap(pil_img, 20))
+            refs["icon_key"] = icon_key
+
+        refs["name"].setText(s["display_name"])
+
+        frac = max(0.005, pct / 100)
+        refs["bar"].set_value(frac, color)
+
+        refs["time"].setText(format_duration_short(s["total_seconds"]))
+        refs["pct"].setText(f"{pct:.1f}%")
+        refs["frame"].setVisible(True)
 
     # ── Actions ───────────────────────────────────────────────
 

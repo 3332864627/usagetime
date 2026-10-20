@@ -12,6 +12,8 @@ class StorageDateTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.original_db_path = storage.DB_PATH
         self.addCleanup(setattr, storage, "DB_PATH", self.original_db_path)
+        # 连接是复用的：测试结束前必须关掉，否则临时库文件被占用删不掉
+        self.addCleanup(storage.close_conn)
         storage.DB_PATH = os.path.join(self.temp_dir.name, "usage.db")
         storage.init_db()
 

@@ -3,7 +3,7 @@ import os
 import sys
 from contextlib import contextmanager
 from datetime import date, timedelta, datetime
-from threading import Lock
+from threading import Lock, local
 
 
 def _get_db_path():
@@ -17,6 +17,8 @@ def _get_db_path():
 
 DB_PATH = _get_db_path()
 _lock = Lock()
+# 每个线程各持有自己的数据库连接（SQLite 连接不能跨线程共用）
+_local = local()
 
 # 内置默认中文名（用户自定义规则优先级更高）
 _APP_NAMES = {
@@ -86,25 +88,51 @@ _DEFAULT_APP_GROUPS = {
 
 # 运行时缓存
 _app_groups_cache = None
+_name_cache = {}   # 显示名缓存（含"查不到"的负缓存）
 
 _PREFERRED_ICON_EXECUTABLES = {
     "hpeesofde.exe": "hpeesofdds.exe",
 }
 
 
+def close_conn():
+    """关闭本线程缓存的连接（换库、退出时用）。"""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _local.conn = None
+    _local.path = None
+
+
 @contextmanager
 def _get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    """复用本线程的连接。
+
+    每次新开连接都要跑一次 PRAGMA journal_mode=WAL，在 Windows 上会触发
+    磁盘同步（实测单次约 47ms）。界面刷新一次要开几百个连接，改用复用之
+    后切换页面快 6~7 倍。连接按线程隔离，不能共用。
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None and getattr(_local, "path", None) != DB_PATH:
+        # DB_PATH 被换掉了，旧连接指向的是别的库，必须重建
+        close_conn()
+        conn = None
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn = conn
+        _local.path = DB_PATH
     try:
         yield conn
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-    finally:
-        conn.close()
 
 
 def init_db():
@@ -292,6 +320,7 @@ def get_app_rules_with_display():
 def add_app_rule(child_name, parent_name, display_name=None):
     global _app_groups_cache
     _app_groups_cache = None
+    _name_cache.clear()   # 规则变了，显示名缓存作废
     with _lock, _get_conn() as conn:
         conn.execute(
             """INSERT OR REPLACE INTO app_rules (child_name, parent_name, display_name)
@@ -303,6 +332,7 @@ def add_app_rule(child_name, parent_name, display_name=None):
 def remove_app_rule(child_name):
     global _app_groups_cache
     _app_groups_cache = None
+    _name_cache.clear()   # 规则变了，显示名缓存作废
     with _lock, _get_conn() as conn:
         conn.execute(
             "DELETE FROM app_rules WHERE child_name = ?",
@@ -452,9 +482,6 @@ def get_display_name(app_name):
     return app_name
 
 
-_name_cache = {}
-
-
 def _extract_display_name(app_name):
     if app_name in _name_cache:
         return _name_cache[app_name]
@@ -487,6 +514,8 @@ def _extract_display_name(app_name):
                 continue
     except Exception:
         pass
+    # 查不到也要缓存，否则每次刷新都会重新枚举全系统进程（实测一次刷新扫 23 遍）
+    _name_cache[app_name] = None
     return None
 
 
@@ -629,6 +658,51 @@ def get_week_app_stats(start_date=None):
                GROUP BY LOWER(app_name)
                ORDER BY total_seconds DESC""",
             (week_start.isoformat(), start_date),
+        ).fetchall()
+    return _merge_rows(rows)
+
+
+def get_month_stats(end_date=None):
+    """获取当月每天的使用统计，从 1 号到 end_date，返回 [{date, total_seconds}, ...]。"""
+    if end_date is None:
+        end_date = date.today().isoformat()
+    d = date.fromisoformat(end_date)
+    month_start = d.replace(day=1)
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """SELECT date, SUM(total_seconds) as total_seconds
+               FROM app_usage
+               WHERE date >= ? AND date <= ?
+               GROUP BY date
+               ORDER BY date""",
+            (month_start.isoformat(), end_date),
+        ).fetchall()
+    result = {r["date"]: r["total_seconds"] for r in rows}
+    days = []
+    cur = month_start
+    while cur <= d:
+        ds = cur.isoformat()
+        days.append({"date": ds, "total_seconds": result.get(ds, 0)})
+        cur += timedelta(days=1)
+    return days
+
+
+def get_month_app_stats(end_date=None):
+    """获取当月（1 号到 end_date）的应用使用排行。"""
+    if end_date is None:
+        end_date = date.today().isoformat()
+    d = date.fromisoformat(end_date)
+    month_start = d.replace(day=1)
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """SELECT LOWER(app_name) as app_name,
+                      SUM(total_seconds) as total_seconds,
+                      COUNT(DISTINCT date) as days_used
+               FROM app_usage
+               WHERE date >= ? AND date <= ?
+               GROUP BY LOWER(app_name)
+               ORDER BY total_seconds DESC""",
+            (month_start.isoformat(), end_date),
         ).fetchall()
     return _merge_rows(rows)
 

@@ -46,10 +46,51 @@ def _active_time_cutoff(now, idle_seconds, idle_threshold):
     return now - idle_seconds + idle_threshold
 
 
+# ── 锁屏检测 ──────────────────────────────────────────────────
+
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_user32.OpenInputDesktop.restype = wintypes.HANDLE
+_user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                     wintypes.DWORD]
+_user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+_user32.GetUserObjectInformationW.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+]
+
+UOI_NAME = 2
+DESKTOP_READOBJECTS = 0x0001
+
+
+def _is_locked():
+    """判断当前是否处于锁屏 / UAC 安全桌面。
+
+    锁屏后输入桌面从 "Default" 切到 "Winlogon"，此时前台窗口冻结在
+    锁屏前的值、空闲计时又会被待机恢复重置，导致继续给旧应用累加时长。
+    句柄拿不到一律按锁屏处理；API 异常时返回 False（宁可多记，不能停记）。
+    """
+    try:
+        hdesk = _user32.OpenInputDesktop(0, False, DESKTOP_READOBJECTS)
+        if not hdesk:
+            return True
+        try:
+            buf = ctypes.create_unicode_buffer(64)
+            needed = wintypes.DWORD()
+            ok = _user32.GetUserObjectInformationW(
+                hdesk, UOI_NAME, buf, ctypes.sizeof(buf),
+                ctypes.byref(needed),
+            )
+            return (not ok) or (buf.value != "Default")
+        finally:
+            _user32.CloseDesktop(hdesk)
+    except Exception:
+        return False
+
+
 # ── 忽略的系统进程 ────────────────────────────────────────────
 
 _IGNORED = {
-    "searchui.exe", "shellexperiencehost.exe", "openwith.exe",
+    "searchui.exe", "searchhost.exe", "shellexperiencehost.exe", "openwith.exe",
     "textinputhost.exe", "lockapp.exe", "applicationframehost.exe",
     "systemsettings.exe", "searchapp.exe", "startmenuexperiencehost.exe",
     "runtimebroker.exe", "sihost.exe", "fontdrvhost.exe",
@@ -218,6 +259,23 @@ class WindowMonitor:
     def _loop(self):
         while self._running:
             if self._paused:
+                time.sleep(self.poll_interval)
+                continue
+
+            # 锁屏 / UAC 安全桌面：先结算，再停表；解锁后靠 _last_hwnd=None 重新起算
+            if _is_locked():
+                now = time.time()
+                if self._was_idle:
+                    self._flush_idle(self._idle_start, now)
+                    self._was_idle = False
+                else:
+                    self._flush_current()
+                self._flush_to_db()
+                self._last_hwnd = None
+                self._last_app = None
+                self._last_title = None
+                self._last_exe = None
+                self._last_start = None
                 time.sleep(self.poll_interval)
                 continue
 
