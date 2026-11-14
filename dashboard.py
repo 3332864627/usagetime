@@ -73,6 +73,9 @@ APP_COLORS = [
     "#A2845E", "#FF6482", "#0A84FF", "#BF5AF2", "#64D2FF",
 ]
 
+# 应用名字显示宽度上限：超长名字（安装包/临时进程）会把整行撑出横向滚动条
+NAME_MAX_WIDTH = 240
+
 DAY_LABELS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 _CN_DAY = {0: "周一", 1: "周二", 2: "周三", 3: "周四",
            4: "周五", 5: "周六", 6: "周日"}
@@ -1287,7 +1290,12 @@ class Dashboard(QWidget):
             refs["icon"].setPixmap(_pil_to_pixmap(pil_img, 20))
             refs["icon_key"] = icon_key
 
-        refs["name"].setText(s["display_name"])
+        # 超长名字截断显示（数据里仍存完整名字，只是不撑宽列表）
+        name_text = s["display_name"]
+        _fm = refs["name"].fontMetrics()
+        if _fm.horizontalAdvance(name_text) > NAME_MAX_WIDTH:
+            name_text = _fm.elidedText(name_text, Qt.ElideRight, NAME_MAX_WIDTH)
+        refs["name"].setText(name_text)
 
         frac = max(0.005, pct / 100)
         refs["bar"].set_value(frac, color)
